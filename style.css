@@ -564,3 +564,5 @@ h1#pageTitle {
 
   .login-box { padding: 22px 18px; }
 }
+
+.hidden { display: none !important; }
