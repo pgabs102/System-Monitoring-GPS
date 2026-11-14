@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="tl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPS Monitoring System</title>
+
+<!-- Supabase CDN -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+<!-- MapLibre GL JS CSS & JS -->
+<link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
+<script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+
+<!-- Ikinonekta ang hiwalay na CSS file -->
+<link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="767/gps-five-themes.css">
+</head>
+<body>
+
+<!-- LOGIN SCREEN -->
+<section id="loginScreen">
+  <div class="login-box">
+    <h2>GPS Monitoring System</h2>
+    <p style="text-align:center;color:#64748b">Account Login</p>
+
+    <form id="loginForm">
+      <label for="email">Email</label>
+      <input id="email" type="email" required autocomplete="username">
+
+      <label for="password">Password</label>
+      <input id="password" type="password" required autocomplete="current-password">
+
+      <button class="primary" id="loginButton" type="submit">Mag-login</button>
+      <p id="loginMessage" role="status"></p>
+    </form>
+  </div>
+</section>
+
+<!-- ADMIN DASHBOARD SCREEN -->
+<section id="dashboardScreen" class="hidden">
+  <header>
+    <h2>GPS Monitoring System (Admin)</h2>
+    <button class="logout-btn" id="logoutAdmin">Logout</button>
+  </header>
+
+  <div class="layout">
+    <nav id="menu">
+      <button class="active" data-page="Dashboard">🏠 Dashboard</button>
+      <button data-page="Live GPS Map">📍 Live GPS Map</button>
+      <button data-page="Users / Accounts">👥 Users / Accounts</button>
+      <button data-page="Location History">🕘 Location History</button>
+      <button data-page="Playback">▶️ Playback</button>
+      <button data-page="Geofence">⭕ Geofence</button>
+      <button data-page="Attendance">📋 Attendance</button>
+      <button data-page="Chat & Photos">💬 Chat & Photos</button>
+      <button data-page="Announcements">📢 Announcements</button>
+      <button data-page="SOS Alerts">🆘 SOS Alerts</button>
+      <button data-page="Daily Reports">📊 Daily Reports</button>
+      <button data-page="Admin Settings">⚙️ Admin Settings</button>
+    </nav>
+
+    <main>
+      <h1 id="pageTitle">Dashboard</h1>
+      <p class="subtitle" id="welcomeText">Administrator</p>
+
+      <div class="cards">
+        <div class="card"><small>Total Users</small><strong>—</strong></div>
+        <div class="card"><small>GPS Active</small><strong>—</strong></div>
+        <div class="card"><small>GPS Unavailable</small><strong>—</strong></div>
+        <div class="card"><small>SOS Alerts</small><strong>—</strong></div>
+      </div>
+
+      <section class="panel">
+        <h3 id="panelTitle">System Overview</h3>
+        <div id="panelContent">
+          Welcome sa GPS Monitoring System Admin Dashboard.
+        </div>
+        <p id="statusMessage">Nakakonekta ang dashboard session.</p>
+      </section>
+    </main>
+  </div>
+</section>
+
+<!-- REGULAR USER DASHBOARD SCREEN -->
+<section id="userScreen" class="hidden">
+  <header>
+    <h2>GPS Tracker User</h2>
+    <button class="logout-btn" id="logoutUser">Logout</button>
+  </header>
+
+  <div class="user-container">
+    <div class="card">
+      <h3 id="userWelcome">Maligayang Pagdating!</h3>
+      <p style="color:#64748b;margin:5px 0;">Status ng iyong GPS:</p>
+      <span class="status-badge" id="gpsStatusText">Sinusuri ang GPS...</span>
+
+      <div style="margin-top:15px;font-size:14px;color:#475569;">
+        <p>📍 <b>Kasalukuyang Lugar:</b> <span id="userLocationName">Inaalam...</span></p>
+      </div>
+
+      <!-- User MapLibre Map Container -->
+      <div id="userMapContainer"></div>
+
+      <button class="sos-btn" id="sosButton">🆘 PIPINDUTIN KAPAG EMERGENCY (SOS)</button>
+    </div>
+  </div>
+</section>
+
+<!-- Ikinonekta ang hiwalay na JavaScript file -->
+<script src="app.js?v=5"></script>
+  
+
+</body>
+</html>
