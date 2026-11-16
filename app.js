@@ -946,7 +946,7 @@ async function loadUsers() {
 
   const { data, error } = await db
     .from("profiles")
-    .select("id, full_name, email, role, location_sharing, is_online, created_at, battery_level, is_charging")
+    .select("id, full_name, email, role, location_sharing, is_online, created_at, battery_level, is_charging, phone")
     .order("created_at", { ascending: false });
 
   if (error) {
@@ -1140,6 +1140,9 @@ async function showCreateUserForm() {
     <input id="newUserPassword" type="password" placeholder="Password (at least 8 characters)" minlength="8" required
       style="display:block;width:100%;padding:12px;margin:8px 0;">
 
+      <input id="newUserPhone" type="tel" placeholder="Phone Number (hal: 09171234567)"
+    style="display:block;width:100%;padding:12px;margin:8px 0;">
+
     <button type="submit" style="padding:12px 20px;">Create User</button>
 
     <p id="createUserMessage"></p>
@@ -1155,9 +1158,14 @@ async function showCreateUserForm() {
     const email = document.getElementById("newUserEmail").value.trim();
     const password = document.getElementById("newUserPassword").value;
 
-    const { data, error } = await db.functions.invoke("admin-create-user", {
-      body: { full_name: fullName, email: email, password: password }
-    });
+const phone = document.getElementById("newUserPhone").value.trim();
+
+const { data, error } = await db.functions.invoke("admin-create-user", {
+  body: { full_name: fullName, email: email, password: password, phone: phone }
+});
+
+    
+    
 
     if (error) {
       message.textContent = "Error: " + error.message;
