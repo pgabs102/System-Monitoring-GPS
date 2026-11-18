@@ -50,6 +50,37 @@ function showLogin(message = "") {
   }
 }
 
+// ===== Auto logout kapag na-deactivate habang naka-login =====
+let ownProfileChannel = null;
+
+function startOwnProfileWatch(userId) {
+  stopOwnProfileWatch();
+
+  ownProfileChannel = db
+    .channel(`own-profile-${userId}`)
+    .on(
+      "postgres_changes",
+      { event: "UPDATE", schema: "public", table: "profiles", filter: `id=eq.${userId}` },
+      async (payload) => {
+        if (payload.new.is_active === false) {
+          currentUserSessionId = null;
+          stopOwnProfileWatch();
+          await db.auth.signOut();
+          showLogin("Na-deactivate ang account mo. Makipag-ugnayan sa admin.");
+        }
+      }
+    )
+    .subscribe();
+}
+
+function stopOwnProfileWatch() {
+  if (ownProfileChannel) {
+    db.removeChannel(ownProfileChannel);
+    ownProfileChannel = null;
+  }
+}
+
+
 function showAdminDashboard(profile) {
   loginScreen.classList.add("hidden");
   userScreen.classList.add("hidden");
