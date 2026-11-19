@@ -3,6 +3,11 @@ const SUPABASE_KEY = "sb_publishable_An-AXhwWYFlFEZ4oxfK8qg_kuaW7rOI";
 
 const db = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
+// Hiwalay na client para sa paggawa ng bagong account nang hindi naka-logout ang admin
+const signupDb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
+  auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false }
+});
+
 const loginScreen = document.getElementById("loginScreen");
 const dashboardScreen = document.getElementById("dashboardScreen");
 const userScreen = document.getElementById("userScreen");
@@ -15,6 +20,8 @@ let userMap = null;
 let userMarker = null;
 let watchPositionId = null;
 let currentUserSessionId = null;
+let mapCenteredOnce = false;
+let usersRefreshTimer = null;
 
 let profilesChannel = null;
 let liveMap = null;
@@ -25,10 +32,13 @@ let batteryTimer = null;
 let batteryVisibilityHandler = null;
 
 let adminSelfId = null;
+let lastUserListMode = null;
 
 let lastGeoLat = null;
 let lastGeoLng = null;
 let lastPlaceName = null;
+
+const adminDashboardHtml = document.getElementById("panelContent").innerHTML;
 
 // ===== Login / screen routing =====
 function showLogin(message = "") {
@@ -41,8 +51,11 @@ function showLogin(message = "") {
   stopBatteryHeartbeat();
   stopLivePoll();
   stopInboxRealtime();
+  stopUsersList();
+  clearOtherUserMarkers();
   liveMap = null;
   stopAdminRealtime();
+  stopOwnProfileWatch();
 
   if (watchPositionId !== null) {
     navigator.geolocation.clearWatch(watchPositionId);
@@ -80,7 +93,6 @@ function stopOwnProfileWatch() {
   }
 }
 
-
 function showAdminDashboard(profile) {
   loginScreen.classList.add("hidden");
   userScreen.classList.add("hidden");
@@ -89,6 +101,7 @@ function showAdminDashboard(profile) {
     "Welcome, " + profile.full_name + " (Admin)";
 
   startAdminRealtime();
+  showAdminPage("Dashboard");
 }
 
 function showUserDashboard(profile, user) {
@@ -102,12 +115,14 @@ function showUserDashboard(profile, user) {
   startUserTracking(user.id);
   startBatteryHeartbeat(user.id);
   startInboxRealtime(user.id);
+  startUsersList(user.id);
+  startOwnProfileWatch(user.id);
 }
 
 async function verifyAndRouteUser(user) {
   const { data: profile, error } = await db
     .from("profiles")
-    .select("full_name, role, location_sharing")
+    .select("full_name, role, location_sharing, is_active")
     .eq("id", user.id)
     .maybeSingle();
 
@@ -115,6 +130,12 @@ async function verifyAndRouteUser(user) {
     console.error("Profile error:", error);
     await db.auth.signOut();
     showLogin("Hindi nahanap ang profile access" + (error ? ": " + error.message : " (walang profile row)"));
+    return false;
+  }
+
+  if (profile.is_active === false) {
+    await db.auth.signOut();
+    showLogin("Na-deactivate ang account mo. Makipag-ugnayan sa admin.");
     return false;
   }
 
@@ -201,16 +222,22 @@ function stopAdminRealtime() {
   }
 }
 
+function handleProfileUpdate(oldRow, newRow) {
+  const page = document.querySelector("#menu button.active")?.dataset.page;
+  if (page === "Live GPS Map" && liveMap) {
+    renderLiveUser(newRow);
+  } else if (page === "Users / Accounts" || page === "Location History" || page === "Chat & Photos") {
+    if (!document.getElementById("adminUsersLoaded")) return;
+    const mode = lastUserListMode || "users";
+    renderUserList(mode);
+  }
+}
+
+// ===== Helpers =====
 function batteryLabel(user) {
   return user.battery_level != null
     ? `${user.battery_level}%${user.is_charging ? " ⚡" : ""}`
     : "N/A";
-}
-
-function liveStatusBadge(online) {
-  return online
-    ? '<span style="color:#137333;font-weight:bold;">🟢 Online</span>'
-    : '<span style="color:#64748b;">⚪ Offline</span>';
 }
 
 function shortPlace(name) {
@@ -218,42 +245,29 @@ function shortPlace(name) {
   return name.split(",").slice(0, 2).join(",").trim();
 }
 
-function handleProfileUpdate(oldRow, newRow) {
-  const page = document.querySelector("#menu button.active")?.dataset.page;
+function isReallyOnline(p) {
+  if (!p.is_online || !p.last_seen) return false;
+  return Date.now() - new Date(p.last_seen).getTime() < 90000;
+}
 
-  const statusChanged = oldRow?.is_online !== newRow.is_online;
-  const batteryChanged =
-    oldRow?.battery_level !== newRow.battery_level ||
-    oldRow?.is_charging !== newRow.is_charging;
-  const locationChanged =
-    oldRow?.latitude !== newRow.latitude ||
-    oldRow?.longitude !== newRow.longitude ||
-    oldRow?.location_name !== newRow.location_name;
+function timeAgo(iso) {
+  if (!iso) return "Hindi pa alam";
+  const mins = Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
+  if (mins < 1) return "Ngayon lang";
+  if (mins < 60) return `${mins} min ang nakalipas`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs} oras ang nakalipas`;
+  return new Date(iso).toLocaleDateString("fil-PH", { month: "short", day: "numeric" });
+}
 
-  if (!statusChanged && !batteryChanged && !locationChanged) return;
+function escapeHtml(str) {
+  return String(str ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
 
-  if (page === "Users / Accounts") {
-    const row = document.querySelector(`tr[data-user-id="${newRow.id}"]`);
-    if (!row) return;
-
-    if (statusChanged) {
-      const cell = row.querySelector(".status-cell");
-      if (cell) {
-        cell.innerHTML = "";
-        const badge = document.createElement("span");
-        badge.className = newRow.is_online ? "badge-online" : "badge-offline";
-        badge.textContent = newRow.is_online ? "Online" : "Offline";
-        cell.appendChild(badge);
-      }
-    }
-
-    if (batteryChanged) {
-      const cell = row.querySelector(".battery-cell");
-      if (cell) cell.textContent = batteryLabel(newRow);
-    }
-  } else if (page === "Live GPS Map" && liveMap) {
-    renderLiveUser(newRow);
-  }
+function telLink(phone) {
+  return `<a href="tel:${escapeHtml(String(phone).replace(/\s/g, ""))}" style="color:#1769aa;">${escapeHtml(phone)}</a>`;
 }
 
 // ===== User map =====
@@ -272,9 +286,10 @@ function initUserMap() {
   });
 
   userMap.addControl(new maplibregl.NavigationControl());
+  addRecenterButton();
 }
 
-// ===== Chat (iisang view para sa user at admin) =====
+// ===== Chat =====
 let activeChat = null;
 
 function destroyActiveChat() {
@@ -348,7 +363,6 @@ async function getCurrentUserId() {
   return data && data.user ? data.user.id : null;
 }
 
-// Gumawa ng chat view sa loob ng container, at makinig sa bagong mensahe ng pag-uusap
 async function mountChat(container, p, title, height, myId, otherId) {
   destroyActiveChat();
   container.innerHTML = chatUIHtml(p, title, height);
@@ -460,42 +474,6 @@ function stopInboxRealtime() {
   destroyActiveChat();
 }
 
-// ===== Admin side: panel ng usapan =====
-function buildAdminChatPanel() {
-  const panel = document.createElement("div");
-  panel.id = "adminChatPanel";
-  panel.style.cssText = "display:none;margin-top:15px;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;background:#fff;";
-  panel.innerHTML = `
-    <div style="padding:8px 10px;background:#1769aa;color:#fff;font-weight:bold;display:flex;justify-content:space-between;align-items:center;">
-      <span id="adminChatTitle">💬 Usapan</span>
-      <button id="adminChatClose" type="button" style="background:#fff;color:#1769aa;border:none;border-radius:4px;padding:2px 8px;">✕</button>
-    </div>
-    <div id="adminChatBody"></div>
-  `;
-  panel.querySelector("#adminChatClose").onclick = stopAdminChat;
-  return panel;
-}
-
-async function openAdminChat(user) {
-  const panel = document.getElementById("adminChatPanel");
-  if (!panel) return;
-
-  document.getElementById("adminChatTitle").textContent =
-    "💬 Usapan: " + (user.full_name || user.email || "User");
-  panel.style.display = "block";
-
-  const myId = adminSelfId || (await getCurrentUserId());
-  await mountChat(document.getElementById("adminChatBody"), "ac", "", 280, myId, user.id);
-
-  panel.scrollIntoView({ behavior: "smooth", block: "start" });
-}
-
-function stopAdminChat() {
-  destroyActiveChat();
-  const panel = document.getElementById("adminChatPanel");
-  if (panel) panel.style.display = "none";
-}
-
 // ===== Battery =====
 async function getBatteryStatus() {
   if (!("getBattery" in navigator)) {
@@ -587,6 +565,8 @@ function distanceMeters(lat1, lng1, lat2, lng2) {
 }
 
 function startUserTracking(userId) {
+  mapCenteredOnce = false;
+
   const gpsStatusText = document.getElementById("gpsStatusText");
   const userLocationName = document.getElementById("userLocationName");
 
@@ -642,7 +622,10 @@ function startUserTracking(userId) {
       });
 
       if (userMap) {
-        userMap.setCenter([lng, lat]);
+        if (!mapCenteredOnce) {
+          userMap.setCenter([lng, lat]);
+          mapCenteredOnce = true;
+        }
         if (!userMarker) {
           userMarker = new maplibregl.Marker({ color: "#1769aa" })
             .setLngLat([lng, lat])
@@ -667,51 +650,1032 @@ document.getElementById("sosButton").addEventListener("click", () => {
   }
 });
 
-// ===== Admin menu =====
-const descriptions = {
-  "Dashboard": "System overview at monitoring summary.",
-  "Live GPS Map": "Dito ipapakita ang mga live GPS location at pangalan ng lugar.",
-  "Users / Accounts": "Pamamahala ng user accounts at profiles.",
-  "Location History": "Mga naitalang lokasyon ng users.",
-  "Playback": "Location playback ayon sa petsa at oras.",
-  "Geofence": "Pamamahala ng authorized monitoring areas.",
-  "Attendance": "Mga check-in at check-out record.",
-  "Chat & Photos": "Communication center at photo messages.",
-  "Announcements": "System announcements.",
-  "SOS Alerts": "Mga emergency alert.",
-  "Daily Reports": "Daily activity reports.",
-  "Admin Settings": "System at administrator settings."
-};
+// ===== Button para bumalik sa posisyon mo =====
+function addRecenterButton() {
+  const container = document.getElementById("userMapContainer");
+  if (!container || document.getElementById("recenterBtn")) return;
 
-document.getElementById("menu").addEventListener("click", function (event) {
-  const button = event.target.closest("button[data-page]");
-  if (!button) return;
+  const btn = document.createElement("button");
+  btn.id = "recenterBtn";
+  btn.type = "button";
+  btn.textContent = "📍 Center sa akin";
+  btn.style.cssText =
+    "margin-top:8px;padding:6px 10px;background:#1769aa;color:#fff;" +
+    "border:none;border-radius:6px;font-size:13px;";
 
-  document.querySelectorAll("#menu button").forEach(item => {
-    item.classList.remove("active");
+  btn.onclick = () => {
+    if (userMarker) {
+      userMap.flyTo({ center: userMarker.getLngLat(), zoom: 15 });
+    }
+  };
+
+  container.insertAdjacentElement("afterend", btn);
+}
+
+// ===== Listahan ng user (para sa kapwa user) =====
+let usersChannel = null;
+let usersPollTimer = null;
+let usersMyId = null;
+let otherUserMarkers = {};
+
+async function loadAllUsers(myId) {
+  const box = document.getElementById("usersListBody");
+  if (!box) return;
+
+  const { data, error } = await db
+    .from("profiles")
+    .select("id, full_name, role, is_online, last_seen, battery_level, is_charging, location_name, latitude, longitude")
+    .neq("id", myId)
+    .neq("role", "admin")
+    .order("full_name", { ascending: true });
+
+  if (error) {
+    console.error("Users list error:", error);
+    box.innerHTML = "<div style='padding:10px;color:#b42318;font-size:13px;'>Hindi maload ang listahan.</div>";
+    return;
+  }
+
+  renderOtherUserMarkers(data || []);
+
+  if (!data || data.length === 0) {
+    box.innerHTML = "<div style='padding:10px;color:#64748b;font-size:13px;'>Walang ibang user.</div>";
+    return;
+  }
+
+  box.innerHTML = data.map((p) => {
+    const online = isReallyOnline(p);
+    const dot = online ? "🟢" : "⚪";
+    const status = online ? "Online" : "Offline · " + timeAgo(p.last_seen);
+    const place = p.location_name ? shortPlace(p.location_name) : "Walang lokasyon";
+    const name = escapeHtml(p.full_name || "User");
+    const hasCoords = p.latitude != null && p.longitude != null;
+    const disabled = hasCoords ? "" : "disabled";
+    const btnStyle = "padding:5px 8px;border:none;border-radius:6px;font-size:12px;color:#fff;white-space:nowrap;";
+
+    return `
+      <div style="padding:10px;border-bottom:1px solid #e2e8f0;">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+          <div style="min-width:0;flex:1;">
+            <div style="font-weight:600;color:#1e293b;">${dot} ${name}</div>
+            <div style="font-size:12px;color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(place)}</div>
+            <div style="font-size:12px;color:${online ? "#137333" : "#64748b"};margin-top:2px;">
+              ${escapeHtml(status)} · 🔋 ${escapeHtml(batteryLabel(p))}
+            </div>
+          </div>
+          <button class="user-chat-btn" data-act="chat" data-uid="${escapeHtml(p.id)}" data-name="${name}" type="button"
+            style="${btnStyle}background:#1769aa;padding:6px 10px;">💬 Chat</button>
+        </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;">
+          <button type="button" data-act="route" ${disabled}
+            data-lat="${p.latitude ?? ""}" data-lng="${p.longitude ?? ""}" data-name="${name}"
+            style="${btnStyle}background:#0f766e;">🧭 Ruta sa mapa</button>
+          <button type="button" data-act="gmap" ${disabled}
+            data-lat="${p.latitude ?? ""}" data-lng="${p.longitude ?? ""}" data-name="${name}"
+            style="${btnStyle}background:#4285f4;">Google Maps</button>
+          <button type="button" data-act="waze" ${disabled}
+            data-lat="${p.latitude ?? ""}" data-lng="${p.longitude ?? ""}" data-name="${name}"
+            style="${btnStyle}background:#33ccff;color:#0b1f2a;">Waze</button>
+        </div>
+      </div>
+    `;
+  }).join("");
+}
+
+function startUsersList(myId) {
+  stopUsersList();
+  usersMyId = myId;
+
+  const old = document.getElementById("usersBox");
+  if (old) old.remove();
+
+  const card = document.querySelector("#userScreen .card");
+  const sos = document.getElementById("sosButton");
+
+  const box = document.createElement("div");
+  box.id = "usersBox";
+  box.style.cssText = "margin-top:15px;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;background:#fff;";
+  box.innerHTML = `
+    <div style="padding:8px 10px;background:#1769aa;color:#fff;font-weight:bold;">👥 Mga User</div>
+    <div id="usersListBody"><div style="padding:10px;color:#64748b;font-size:13px;">Naglo-load...</div></div>
+  `;
+  card.insertBefore(box, sos);
+
+  document.getElementById("usersListBody").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-act]");
+    if (!btn || btn.disabled) return;
+
+    const act = btn.dataset.act;
+    const lat = parseFloat(btn.dataset.lat);
+    const lng = parseFloat(btn.dataset.lng);
+    const name = btn.dataset.name;
+
+    if (act === "chat") openUserChat(btn.dataset.uid, name);
+    else if (act === "route") showRouteOnMap(lng, lat, name);
+    else if (act === "gmap") openGoogleMaps(lat, lng);
+    else if (act === "waze") openWaze(lat, lng);
   });
 
-  button.classList.add("active");
-  closeMenu();
-  liveMap = null;
-  stopLivePoll();
-  stopAdminChat();
+  loadAllUsers(myId);
 
-  const page = button.dataset.page;
-  document.getElementById("pageTitle").textContent = page;
-  document.getElementById("panelTitle").textContent = page;
+  usersChannel = db
+    .channel(`users-list-${myId}`)
+    .on("postgres_changes", { event: "*", schema: "public", table: "profiles" }, () => {
+      clearTimeout(usersRefreshTimer);
+      usersRefreshTimer = setTimeout(() => loadAllUsers(myId), 1500);
+    })
+    .subscribe();
 
-  if (page === "Users / Accounts") {
-    loadUsers();
-  } else if (page === "Live GPS Map") {
-    loadLiveMaplibre();
-  } else if (page === "Geofence") {
-    loadGeofencePanel();
-  } else {
-    document.getElementById("panelContent").textContent = descriptions[page] || "";
+  usersPollTimer = setInterval(() => loadAllUsers(myId), 30000);
+}
+
+function stopUsersList() {
+  if (usersChannel) {
+    db.removeChannel(usersChannel);
+    usersChannel = null;
   }
+  if (usersPollTimer) {
+    clearInterval(usersPollTimer);
+    usersPollTimer = null;
+  }
+  clearTimeout(usersRefreshTimer);
+  clearOtherUserMarkers();
+}
+
+// ===== Markers ng ibang user sa mapa =====
+function makeInitialMarkerEl(name, online) {
+  const el = document.createElement("div");
+  const initial = Array.from((name || "U").trim())[0] || "U";
+  el.textContent = initial.toUpperCase();
+  el.title = name || "User";
+  el.style.cssText =
+    "width:26px;height:26px;border-radius:50%;" +
+    "background:" + (online ? "#137333" : "#94a3b8") + ";" +
+    "color:#fff;font-size:12px;font-weight:bold;font-family:sans-serif;" +
+    "display:flex;align-items:center;justify-content:center;" +
+    "border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.35);cursor:pointer;";
+  return el;
+}
+
+function renderOtherUserMarkers(rows) {
+  if (!userMap || typeof maplibregl === "undefined") return;
+
+  const seenIds = new Set();
+
+  rows.forEach((p) => {
+    if (p.latitude == null || p.longitude == null) return;
+
+    seenIds.add(p.id);
+    const online = isReallyOnline(p);
+    const lngLat = [p.longitude, p.latitude];
+    const label = `${p.full_name || "User"} · ${online ? "Online" : "Offline"} · ${shortPlace(p.location_name)}`;
+    const existing = otherUserMarkers[p.id];
+
+    if (existing) {
+      existing.setLngLat(lngLat);
+      const el = existing.getElement();
+      el.style.background = online ? "#137333" : "#94a3b8";
+      el.textContent = (Array.from((p.full_name || "U").trim())[0] || "U").toUpperCase();
+      el.title = p.full_name || "User";
+      existing.getPopup().setText(label);
+    } else {
+      const popup = new maplibregl.Popup({ offset: 16 }).setText(label);
+      otherUserMarkers[p.id] = new maplibregl.Marker({
+        element: makeInitialMarkerEl(p.full_name, online)
+      })
+        .setLngLat(lngLat)
+        .setPopup(popup)
+        .addTo(userMap);
+    }
+  });
+
+  Object.keys(otherUserMarkers).forEach((id) => {
+    if (!seenIds.has(id)) {
+      otherUserMarkers[id].remove();
+      delete otherUserMarkers[id];
+    }
+  });
+}
+
+function clearOtherUserMarkers() {
+  Object.values(otherUserMarkers).forEach((m) => m.remove());
+  otherUserMarkers = {};
+}
+
+// ===== Chat sa kapwa user =====
+async function openUserChat(otherId, name) {
+  const inbox = document.getElementById("chatBox");
+  if (inbox) inbox.style.display = "none";
+
+  const box = document.getElementById("usersBox");
+  let panel = document.getElementById("userChatPanel");
+  if (!panel) {
+    panel = document.createElement("div");
+    panel.id = "userChatPanel";
+    box.appendChild(panel);
+  }
+
+  panel.style.display = "block";
+  panel.innerHTML = `
+    <div style="padding:8px 10px;background:#0f5a8f;color:#fff;font-weight:bold;display:flex;justify-content:space-between;align-items:center;">
+      <span>💬 ${escapeHtml(name)}</span>
+      <button id="userChatClose" type="button" style="background:#fff;color:#1769aa;border:none;border-radius:4px;padding:2px 8px;">✕</button>
+    </div>
+    <div id="userChatBody"></div>
+  `;
+  panel.querySelector("#userChatClose").onclick = closeUserChat;
+
+  await mountChat(document.getElementById("userChatBody"), "pc", "", 260, usersMyId, otherId);
+  panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function closeUserChat() {
+  destroyActiveChat();
+
+  const panel = document.getElementById("userChatPanel");
+  if (panel) panel.style.display = "none";
+
+  startInboxRealtime(usersMyId);
+}
+
+// ===== Navigation: Google Maps, Waze, at ruta sa mapa =====
+const ROUTE_SRC = "route-src";
+const ROUTE_LAYER = "route-line";
+let routeDestMarker = null;
+
+function getMyLngLat() {
+  if (userMarker) return userMarker.getLngLat();
+  if (lastGeoLat != null && lastGeoLng != null) return { lng: lastGeoLng, lat: lastGeoLat };
+  return null;
+}
+
+function openGoogleMaps(lat, lng) {
+  const me = getMyLngLat();
+  const origin = me ? `&origin=${me.lat},${me.lng}` : "";
+  window.open(
+    `https://www.google.com/maps/dir/?api=1${origin}&destination=${lat},${lng}&travelmode=driving`,
+    "_blank"
+  );
+}
+
+function openWaze(lat, lng) {
+  window.open(`https://www.waze.com/ul?ll=${lat},${lng}&navigate=yes`, "_blank");
+}
+
+async function showRouteOnMap(toLng, toLat, name) {
+  if (!userMap) return alert("Hindi pa handa ang mapa.");
+  if (isNaN(toLng) || isNaN(toLat)) return alert("Walang lokasyon ang user na ito.");
+
+  const me = getMyLngLat();
+  if (!me) return alert("Hindi pa alam ang lokasyon mo. Hintayin ang GPS.");
+
+  let coords = [[me.lng, me.lat], [toLng, toLat]];
+  try {
+    const url = `https://router.project-osrm.org/route/v1/driving/${me.lng},${me.lat};${toLng},${toLat}?overview=full&geometries=geojson`;
+    const res = await fetch(url);
+    const json = await res.json();
+    if (json.code === "Ok" && json.routes && json.routes[0]) {
+      coords = json.routes[0].geometry.coordinates;
+    }
+  } catch (e) {
+    console.warn("Hindi ma-reach ang routing service, straight line ang gagamitin.", e);
+  }
+
+  if (!userMap.isStyleLoaded()) {
+    await new Promise((resolve) => userMap.once("load", resolve));
+  }
+
+  const geojson = { type: "Feature", geometry: { type: "LineString", coordinates: coords } };
+
+  if (userMap.getSource(ROUTE_SRC)) {
+    userMap.getSource(ROUTE_SRC).setData(geojson);
+  } else {
+    userMap.addSource(ROUTE_SRC, { type: "geojson", data: geojson });
+    userMap.addLayer({
+      id: ROUTE_LAYER,
+      type: "line",
+      source: ROUTE_SRC,
+      layout: { "line-join": "round", "line-cap": "round" },
+      paint: { "line-color": "#1769aa", "line-width": 5, "line-opacity": 0.85 }
+    });
+  }
+
+  if (routeDestMarker) routeDestMarker.remove();
+  routeDestMarker = new maplibregl.Marker({ color: "#dc2626" })
+    .setLngLat([toLng, toLat])
+    .setPopup(new maplibregl.Popup({ offset: 16 }).setText("Patutungo: " + name))
+    .addTo(userMap);
+
+  const bounds = new maplibregl.LngLatBounds();
+  coords.forEach((c) => bounds.extend(c));
+  userMap.fitBounds(bounds, { padding: 60, maxZoom: 16 });
+
+  ensureClearRouteButton();
+}
+
+function clearRoute() {
+  if (!userMap) return;
+  if (userMap.getLayer(ROUTE_LAYER)) userMap.removeLayer(ROUTE_LAYER);
+  if (userMap.getSource(ROUTE_SRC)) userMap.removeSource(ROUTE_SRC);
+  if (routeDestMarker) {
+    routeDestMarker.remove();
+    routeDestMarker = null;
+  }
+  const btn = document.getElementById("clearRouteBtn");
+  if (btn) btn.remove();
+}
+
+function ensureClearRouteButton() {
+  if (document.getElementById("clearRouteBtn")) return;
+  const anchor = document.getElementById("recenterBtn");
+  if (!anchor) return;
+
+  const btn = document.createElement("button");
+  btn.id = "clearRouteBtn";
+  btn.type = "button";
+  btn.textContent = "✕ Alisin ruta";
+  btn.style.cssText =
+    "margin-top:8px;margin-left:6px;padding:6px 10px;background:#64748b;color:#fff;" +
+    "border:none;border-radius:6px;font-size:13px;";
+  btn.onclick = clearRoute;
+  anchor.insertAdjacentElement("afterend", btn);
+}
+
+// ===== Admin: pangkalahatang helpers =====
+function stopLivePoll() {
+  if (livePollTimer) {
+    clearInterval(livePollTimer);
+    livePollTimer = null;
+  }
+}
+
+async function fetchReverseGeocode(lat, lng) {
+  try {
+    const res = await fetch(
+      `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}`,
+      { headers: { "Accept-Language": "fil,en" } }
+    );
+    const data = await res.json();
+    return data.display_name || null;
+  } catch (e) {
+    console.error("Reverse geocode error:", e);
+    return null;
+  }
+}
+
+// ===== Admin: Live GPS Map =====
+function initLiveMap() {
+  if (liveMap || typeof maplibregl === "undefined") return;
+
+  liveMap = new maplibregl.Map({
+    container: "liveMapContainer",
+    style: "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
+    center: [120.9842, 14.5995],
+    zoom: 12
+  });
+
+  liveMap.addControl(new maplibregl.NavigationControl());
+}
+
+function renderLiveMapPage() {
+  setAdminContent(`
+    <div id="liveMapContainer" style="height:450px;border-radius:8px;"></div>
+    <div id="adminLiveList" style="margin-top:12px;"></div>
+    <div id="liveChatPanel" style="margin-top:12px;"></div>
+  `);
+  initLiveMap();
+  loadLiveUsers();
+  livePollTimer = setInterval(loadLiveUsers, 30000);
+}
+
+async function loadLiveUsers() {
+  const { data, error } = await db
+    .from("profiles")
+    .select("id, full_name, phone, latitude, longitude, location_name, is_online, last_seen, battery_level, is_charging, location_sharing, role")
+    .neq("role", "admin");
+
+  if (error) {
+    console.error("Live users error:", error);
+    return;
+  }
+
+  const rows = data || [];
+  const ids = new Set(rows.map((r) => r.id));
+
+  Object.keys(liveMarkers).forEach((id) => {
+    if (!ids.has(id)) {
+      liveMarkers[id].marker.remove();
+      delete liveMarkers[id];
+    }
+  });
+
+  rows.forEach((r) => renderLiveUser(r));
+  renderAdminLiveList(rows);
+}
+
+function buildLiveAdminPopup(uid) {
+  const wrap = document.createElement("div");
+  wrap.style.cssText = "font-family:Arial,sans-serif;font-size:13px;line-height:1.5;min-width:220px;";
+  const btnBase = "padding:6px 10px;border:none;border-radius:6px;color:#fff;font-size:12px;";
+
+  wrap.innerHTML = `
+    <strong class="lp-name" style="font-size:14px;color:#1769aa;"></strong><br>
+    <span class="lp-status"></span><br>
+    <span class="lp-phone"></span><br>
+    <span class="lp-batt"></span><br>
+    <span class="lp-place"></span><br>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;">
+      <button type="button" class="lp-chat" style="${btnBase}background:#1769aa;">💬 Chat</button>
+      <button type="button" class="lp-gmap" style="${btnBase}background:#4285f4;">Google Maps</button>
+      <button type="button" class="lp-waze" style="${btnBase}background:#33ccff;color:#0b1f2a;">Waze</button>
+    </div>
+  `;
+
+  wrap.querySelector(".lp-chat").onclick = () => openLiveChat(uid);
+  wrap.querySelector(".lp-gmap").onclick = () => {
+    const u = liveUserData[uid];
+    if (u && u.latitude != null) openGoogleMaps(u.latitude, u.longitude);
+  };
+  wrap.querySelector(".lp-waze").onclick = () => {
+    const u = liveUserData[uid];
+    if (u && u.latitude != null) openWaze(u.latitude, u.longitude);
+  };
+
+  return wrap;
+}
+
+function renderLiveUser(row) {
+  if (!liveMap || row.latitude == null || row.longitude == null) return;
+
+  liveUserData[row.id] = row;
+  const lngLat = [row.longitude, row.latitude];
+  const online = isReallyOnline(row);
+  const name = row.full_name || "User";
+
+  if (!liveMarkers[row.id]) {
+    const content = buildLiveAdminPopup(row.id);
+    const popup = new maplibregl.Popup({ offset: 16 }).setDOMContent(content);
+    const marker = new maplibregl.Marker({ element: makeInitialMarkerEl(name, online) })
+      .setLngLat(lngLat)
+      .setPopup(popup)
+      .addTo(liveMap);
+    liveMarkers[row.id] = { marker, content };
+  }
+
+  const { marker, content } = liveMarkers[row.id];
+  marker.setLngLat(lngLat);
+
+  const el = marker.getElement();
+  el.style.background = online ? "#137333" : "#94a3b8";
+  el.textContent = (Array.from(name.trim())[0] || "U").toUpperCase();
+  el.title = name;
+
+  content.querySelector(".lp-name").textContent = name;
+  content.querySelector(".lp-status").innerHTML = online
+    ? '<span style="color:#137333;font-weight:bold;">🟢 Online</span>'
+    : '<span style="color:#64748b;">⚪ Offline · ' + escapeHtml(timeAgo(row.last_seen)) + '</span>';
+  content.querySelector(".lp-phone").innerHTML = row.phone
+    ? "📞 " + telLink(row.phone)
+    : "📞 Walang numero";
+  content.querySelector(".lp-batt").textContent = "🔋 Baterya: " + batteryLabel(row);
+  content.querySelector(".lp-place").textContent = "📍 " + shortPlace(row.location_name);
+}
+
+function renderAdminLiveList(rows) {
+  const box = document.getElementById("adminLiveList");
+  if (!box) return;
+
+  if (!rows.length) {
+    box.innerHTML = "<div style='color:#64748b;font-size:13px;'>Walang user.</div>";
+    return;
+  }
+
+  const btn = "padding:6px 10px;border:none;border-radius:6px;color:#fff;font-size:13px;margin:2px;";
+  const body = rows.map((p) => {
+    const online = isReallyOnline(p);
+    const name = escapeHtml(p.full_name || "User");
+    const hasCoords = p.latitude != null && p.longitude != null;
+    const disabled = hasCoords ? "" : "disabled";
+    const lat = hasCoords ? p.latitude : "";
+    const lng = hasCoords ? p.longitude : "";
+    const phoneCell = p.phone ? telLink(p.phone) : "—";
+
+    return `
+      <tr style="border-bottom:1px solid #e2e8f0;">
+        <td style="padding:8px;">${name}</td>
+        <td style="padding:8px;">${phoneCell}</td>
+        <td style="padding:8px;color:${online ? "#137333" : "#64748b"};">${online ? "🟢 Online" : "⚪ Offline"}</td>
+        <td style="padding:8px;">${escapeHtml(batteryLabel(p))}</td>
+        <td style="padding:8px;">${escapeHtml(p.location_name ? shortPlace(p.location_name) : "—")}</td>
+        <td style="padding:8px;white-space:nowrap;">
+          <button type="button" data-act="live-chat" data-uid="${escapeHtml(p.id)}" style="${btn}background:#1769aa;">💬 Chat</button>
+          <button type="button" data-act="nav-gmap" data-lat="${lat}" data-lng="${lng}" ${disabled} style="${btn}background:#4285f4;">Google Maps</button>
+          <button type="button" data-act="nav-waze" data-lat="${lat}" data-lng="${lng}" ${disabled} style="${btn}background:#33ccff;color:#0b1f2a;">Waze</button>
+        </td>
+      </tr>`;
+  }).join("");
+
+  box.innerHTML = `
+    <div style="overflow-x:auto;">
+      <table style="width:100%;border-collapse:collapse;font-size:14px;">
+        <thead>
+          <tr style="text-align:left;border-bottom:2px solid #e2e8f0;">
+            <th style="padding:8px;">Pangalan</th>
+            <th style="padding:8px;">Telepono</th>
+            <th style="padding:8px;">Status</th>
+            <th style="padding:8px;">Baterya</th>
+            <th style="padding:8px;">Lugar</th>
+            <th style="padding:8px;">Aksyon</th>
+          </tr>
+        </thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+async function openLiveChat(uid) {
+  const panel = document.getElementById("liveChatPanel");
+  if (!panel) return;
+
+  const u = liveUserData[uid];
+  const name = u ? (u.full_name || "User") : "User";
+
+  panel.innerHTML = `
+    <div style="padding:8px 10px;background:#1769aa;color:#fff;font-weight:bold;display:flex;justify-content:space-between;align-items:center;border-radius:8px 8px 0 0;">
+      <span>💬 ${escapeHtml(name)}</span>
+      <button id="liveChatClose" type="button" style="background:#fff;color:#1769aa;border:none;border-radius:4px;padding:2px 8px;">✕</button>
+    </div>
+    <div id="liveChatBody" style="border:1px solid #e2e8f0;border-top:none;border-radius:0 0 8px 8px;overflow:hidden;background:#fff;"></div>
+  `;
+
+  panel.querySelector("#liveChatClose").onclick = () => {
+    destroyActiveChat();
+    panel.innerHTML = "";
+  };
+
+  const myId = adminSelfId || (await getCurrentUserId());
+  await mountChat(document.getElementById("liveChatBody"), "lc", "", 260, myId, uid);
+  panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+// ===== Admin: pages =====
+function setAdminContent(html) {
+  destroyActiveChat();
+  document.getElementById("panelContent").innerHTML = html;
+}
+
+const adminDescriptions = {
+  "Playback": "I-replay ang galaw ng user. (Malapit na)",
+  "Geofence": "Pamahalaan ang mga geofence zone. (Malapit na)",
+  "Attendance": "Talaan ng attendance. (Malapit na)",
+  "Announcements": "Mga anunsyo. (Malapit na)",
+  "SOS Alerts": "Mga SOS alert. (Malapit na)",
+  "Daily Reports": "Pang-araw-araw na ulat. (Malapit na)",
+  "Admin Settings": "Mga setting ng admin. (Malapit na)"
+};
+
+async function showAdminPage(page) {
+  lastUserListMode = null;
+  stopLivePoll();
+  destroyActiveChat();
+  liveMap = null;
+  liveMarkers = {};
+  liveUserData = {};
+
+  switch (page) {
+    case "Dashboard":
+      return renderAdminDashboard();
+    case "Live GPS Map":
+      return renderLiveMapPage();
+    case "Users / Accounts":
+      return renderUserList("users");
+    case "Location History":
+      return renderUserList("history");
+    case "Chat & Photos":
+      return renderUserList("chat");
+    default:
+      setAdminContent(adminDescriptions[page] || "");
+  }
+}
+
+async function renderAdminDashboard() {
+  setAdminContent(adminDashboardHtml);
+
+  const { data, error } = await db
+    .from("profiles")
+    .select("id, role, is_online, last_seen, location_sharing, is_active");
+
+  if (error || !data) return;
+
+  const users = data.filter((p) => p.role !== "admin");
+  const online = users.filter((p) => isReallyOnline(p)).length;
+  const cards = document.querySelectorAll(".cards .card strong");
+  if (cards[0]) cards[0].textContent = users.length;
+  if (cards[1]) cards[1].textContent = users.filter((p) => p.location_sharing).length;
+  if (cards[2]) cards[2].textContent = users.filter((p) => !p.location_sharing).length;
+  if (cards[3]) cards[3].textContent = online;
+}
+
+// ===== Admin: gumawa ng user =====
+function createUserFormHtml() {
+  const inp = "padding:8px;border:1px solid #cbd5e1;border-radius:6px;width:100%;box-sizing:border-box;";
+  return `
+    <details style="margin-bottom:14px;border:1px solid #e2e8f0;border-radius:8px;padding:10px;background:#fff;">
+      <summary style="cursor:pointer;font-weight:bold;color:#1769aa;">➕ Gumawa ng bagong user</summary>
+      <div style="display:grid;gap:8px;margin-top:10px;">
+        <input id="newUserName" type="text" placeholder="Buong pangalan" style="${inp}">
+        <input id="newUserEmail" type="email" placeholder="Email" style="${inp}">
+        <input id="newUserPhone" type="tel" placeholder="Telepono (hal. 09171234567)" style="${inp}">
+        <input id="newUserPassword" type="password" placeholder="Password (min. 6 characters)" style="${inp}">
+        <select id="newUserRole" style="${inp}">
+          <option value="user">User</option>
+          <option value="admin">Admin</option>
+        </select>
+        <button type="button" data-act="create-user"
+          style="padding:8px;background:#1769aa;color:#fff;border:none;border-radius:6px;">Gumawa ng account</button>
+        <div id="createUserMsg" style="font-size:13px;color:#b42318;"></div>
+      </div>
+    </details>
+  `;
+}
+
+async function handleCreateUser(btn) {
+  const msg = document.getElementById("createUserMsg");
+  const name = document.getElementById("newUserName").value.trim();
+  const email = document.getElementById("newUserEmail").value.trim();
+  const phone = document.getElementById("newUserPhone").value.trim();
+  const password = document.getElementById("newUserPassword").value;
+  const role = document.getElementById("newUserRole").value;
+
+  if (!name || !email || !phone || !password) {
+    msg.style.color = "#b42318";
+    msg.textContent = "Kumpletuhin ang pangalan, email, telepono, at password.";
+    return;
+  }
+  if (!/^\+?[0-9\s-]{7,20}$/.test(phone)) {
+    msg.style.color = "#b42318";
+    msg.textContent = "Hindi valid ang numero ng telepono.";
+    return;
+  }
+  if (password.length < 6) {
+    msg.style.color = "#b42318";
+    msg.textContent = "Dapat at least 6 characters ang password.";
+    return;
+  }
+
+  btn.disabled = true;
+  msg.style.color = "#64748b";
+  msg.textContent = "Ginagawa ang account...";
+
+  try {
+    const { data, error } = await db.functions.invoke("admin-create-user", {
+      body: { email, password, full_name: name, phone, role }
+    });
+
+    if (error) {
+      let errMsg = error.message || String(error);
+      if (error.context && typeof error.context.json === "function") {
+        try {
+          const body = await error.context.json();
+          if (body && body.error) errMsg = body.error;
+        } catch (_) {}
+      }
+      throw new Error(errMsg);
+    }
+    if (data && data.error) throw new Error(data.error);
+
+    alert("Matagumpay na nagawa ang account ng " + name + ".");
+    renderUserList("users");
+  } catch (err) {
+    msg.style.color = "#b42318";
+    msg.textContent = "Error: " + err.message;
+    btn.disabled = false;
+  }
+}
+
+  
+  
+    
+
+// ===== Admin: listahan ng users =====
+// ===== Admin: i-activate / i-deactivate =====
+async function toggleUserActive(userId, makeActive) {
+  const label = makeActive ? "i-activate" : "i-deactivate";
+  if (!confirm("Sigurado ka bang gusto mong " + label + " ang account na ito?")) return;
+
+  const changes = { is_active: makeActive };
+  if (!makeActive) {
+    changes.is_online = false;
+    changes.location_sharing = false;
+  }
+
+  const { data, error } = await db
+    .from("profiles")
+    .update(changes)
+    .eq("id", userId)
+    .select("id, is_active");
+
+  if (error) {
+    alert("Error: " + error.message);
+    return;
+  }
+  if (!data || data.length === 0) {
+    alert("Hindi na-update ang account. Tingnan kung tama ang SQL policy at admin ang role mo.");
+    return;
+  }
+
+  renderUserList(lastUserListMode || "users");
+}
+async function renderUserList(mode) {
+  lastUserListMode = mode;
+  const formHtml = mode === "users" ? createUserFormHtml() : "";
+  setAdminContent(formHtml + "<div id='adminUsersLoaded' style='color:#64748b;font-size:13px;'>Naglo-load...</div>");
+
+  const { data, error } = await db
+    .from("profiles")
+    .select("id, full_name, phone, role, is_active, is_online, last_seen, battery_level, is_charging, location_name")
+    .neq("role", "admin")
+    .order("full_name", { ascending: true });
+
+  if (error) {
+    setAdminContent(formHtml + "<div style='color:#b42318;'>Error: " + escapeHtml(error.message) + "</div>");
+    return;
+  }
+  if (!data || data.length === 0) {
+    setAdminContent(formHtml + "<div style='color:#64748b;'>Walang user.</div>");
+    return;
+  }
+
+  const btn = "padding:6px 10px;border:none;border-radius:6px;color:#fff;font-size:13px;margin:2px;";
+
+  const rows = data.map((p) => {
+    const online = isReallyOnline(p);
+    const active = p.is_active !== false;
+    const name = escapeHtml(p.full_name || "User");
+    const uid = escapeHtml(p.id);
+    const phoneCell = p.phone ? telLink(p.phone) : "—";
+    let actions = "";
+
+    if (mode === "users" || mode === "chat") {
+      actions += `<button type="button" data-act="admin-chat" data-uid="${uid}" data-name="${name}" style="${btn}background:#1769aa;">💬 Chat</button>`;
+    }
+    if (mode === "users" || mode === "history") {
+      actions += `<button type="button" data-act="admin-history" data-uid="${uid}" data-name="${name}" style="${btn}background:#0f766e;">🕘 History</button>`;
+    }
+    if (mode === "users") {
+      actions += active
+        ? `<button type="button" data-act="toggle-active" data-uid="${uid}" data-active="true" style="${btn}background:#b42318;">⏸ Deactivate</button>`
+        : `<button type="button" data-act="toggle-active" data-uid="${uid}" data-active="false" style="${btn}background:#137333;">▶ Activate</button>`;
+    }
+
+    return `
+      <tr style="border-bottom:1px solid #e2e8f0;">
+        <td style="padding:8px;">${name}${active ? "" : " <small style='color:#b42318;'>(naka-deactivate)</small>"}</td>
+        <td style="padding:8px;">${phoneCell}</td>
+        <td style="padding:8px;color:${online ? "#137333" : "#64748b"};">${online ? "🟢 Online" : "⚪ Offline"}</td>
+        <td style="padding:8px;">${escapeHtml(batteryLabel(p))}</td>
+        <td style="padding:8px;">${escapeHtml(p.location_name ? shortPlace(p.location_name) : "—")}</td>
+        <td style="padding:8px;">${actions}</td>
+      </tr>`;
+  }).join("");
+
+  setAdminContent(formHtml + `
+    <div id="adminUsersLoaded" style="overflow-x:auto;">
+      <table style="width:100%;border-collapse:collapse;font-size:14px;">
+        <thead>
+          <tr style="text-align:left;border-bottom:2px solid #e2e8f0;">
+            <th style="padding:8px;">Pangalan</th>
+            <th style="padding:8px;">Telepono</th>
+            <th style="padding:8px;">Status</th>
+            <th style="padding:8px;">Baterya</th>
+            <th style="padding:8px;">Lugar</th>
+            <th style="padding:8px;">Aksyon</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+  `);
+}
+
+async function renderAdminChatPage(userId, name) {
+  setAdminContent(`
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;">
+      <button type="button" data-act="admin-back" style="padding:6px 10px;border:none;border-radius:6px;background:#64748b;color:#fff;">← Listahan</button>
+      <strong>💬 ${escapeHtml(name)}</strong>
+    </div>
+    <div id="adminChatBody"></div>
+  `);
+
+  const myId = adminSelfId || (await getCurrentUserId());
+  await mountChat(document.getElementById("adminChatBody"), "ac", "", 380, myId, userId);
+}
+
+async function renderUserHistory(userId, name) {
+  setAdminContent("<div style='color:#64748b;font-size:13px;'>Naglo-load...</div>");
+
+  const { data, error } = await db
+    .from("location_logs")
+    .select("created_at, event, location_name, latitude, longitude, battery_level, is_charging")
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false })
+    .limit(500);
+
+  if (error) {
+    setAdminContent("<div style='color:#b42318;'>Error: " + escapeHtml(error.message) + "</div>");
+    return;
+  }
+
+  const back = `<button type="button" data-act="admin-back" style="margin-bottom:10px;padding:6px 10px;border:none;border-radius:6px;background:#64748b;color:#fff;">← Listahan</button>`;
+
+  if (!data || data.length === 0) {
+    setAdminContent(back + "<div style='color:#64748b;'>Walang history si " + escapeHtml(name) + ".</div>");
+    return;
+  }
+
+  const eventLabel = (ev) => {
+    if (ev === "login") return "🟢 Login";
+    if (ev === "logout") return "🔴 Logout";
+    return "📍 Lokasyon";
+  };
+  const coordText = (r) =>
+    r.latitude != null && r.longitude != null
+      ? `${Number(r.latitude).toFixed(6)}, ${Number(r.longitude).toFixed(6)}`
+      : "—";
+  const placeText = (r) => r.location_name || "—";
+  const battText = (r) => (r.battery_level != null ? r.battery_level + "%" : "—");
+
+  const btnStyle = "padding:6px 10px;border:none;border-radius:6px;color:#fff;font-size:13px;";
+  const toolbar = `
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+      <button type="button" id="histCsvBtn" style="${btnStyle}background:#137333;">⬇ I-save bilang CSV (Excel)</button>
+      <button type="button" id="histPdfBtn" style="${btnStyle}background:#b42318;">🖨 I-save bilang PDF</button>
+    </div>`;
+
+  const rows = data.map((r) => {
+    const isSession = r.event === "login" || r.event === "logout";
+    const rowBg = r.event === "login" ? "background:#e7f6ec;" : r.event === "logout" ? "background:#fdecea;" : "";
+    return `
+    <tr style="border-bottom:1px solid #e2e8f0;${rowBg}${isSession ? "font-weight:bold;" : ""}">
+      <td style="padding:6px;">${escapeHtml(new Date(r.created_at).toLocaleString("fil-PH"))}</td>
+      <td style="padding:6px;">${eventLabel(r.event)}</td>
+      <td style="padding:6px;">${escapeHtml(placeText(r))}</td>
+      <td style="padding:6px;">${escapeHtml(coordText(r))}</td>
+      <td style="padding:6px;">${escapeHtml(battText(r))}</td>
+    </tr>`;
+  }).join("");
+
+  setAdminContent(`
+    ${back}
+    <h3 style="margin:0 0 8px;">🕘 ${escapeHtml(name)}</h3>
+    ${toolbar}
+    <div style="overflow-x:auto;">
+      <table style="width:100%;border-collapse:collapse;font-size:13px;">
+        <thead>
+          <tr style="text-align:left;border-bottom:2px solid #e2e8f0;">
+            <th style="padding:6px;">Oras</th>
+            <th style="padding:6px;">Uri</th>
+            <th style="padding:6px;">Lugar</th>
+            <th style="padding:6px;">Coordinates</th>
+            <th style="padding:6px;">Baterya</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+  `);
+
+  const plainEvent = (ev) => (ev === "login" ? "Login" : ev === "logout" ? "Logout" : "Lokasyon");
+  const csvEscape = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+
+  document.getElementById("histCsvBtn").onclick = () => {
+    const header = ["Oras", "Uri", "Lugar", "Latitude", "Longitude", "Baterya", "Charging"];
+    const lines = data.map((r) => [
+      new Date(r.created_at).toLocaleString("fil-PH"),
+      plainEvent(r.event),
+      r.location_name || "",
+      r.latitude ?? "",
+      r.longitude ?? "",
+      r.battery_level ?? "",
+      r.is_charging == null ? "" : (r.is_charging ? "Oo" : "Hindi")
+    ].map(csvEscape).join(","));
+
+    const csv = "\uFEFF" + [header.map(csvEscape).join(","), ...lines].join("\r\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const today = new Date().toISOString().slice(0, 10);
+    a.href = url;
+    a.download = `history_${(name || "user").replace(/[^\w]+/g, "_")}_${today}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  document.getElementById("histPdfBtn").onclick = () => {
+    const win = window.open("", "_blank");
+    if (!win) {
+      alert("Pinigilan ng browser ang popup. Payagan ito at subukan ulit.");
+      return;
+    }
+    win.document.write(`
+      <html><head><title>History - ${escapeHtml(name)}</title>
+      <style>
+        body { font-family: Arial, sans-serif; font-size: 12px; margin: 20px; }
+        h2 { color: #6b0000; margin: 0 0 4px; }
+        p { color: #64748b; margin: 0 0 12px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { border-bottom: 1px solid #ccc; padding: 6px; text-align: left; }
+        th { background: #fbf1d0; }
+        tr.login td { background: #e7f6ec; font-weight: bold; }
+        tr.logout td { background: #fdecea; font-weight: bold; }
+      </style></head><body>
+      <h2>Location History: ${escapeHtml(name)}</h2>
+      <p>Na-export: ${escapeHtml(new Date().toLocaleString("fil-PH"))} · ${data.length} na talaan</p>
+      <table>
+        <thead><tr><th>Oras</th><th>Uri</th><th>Lugar</th><th>Coordinates</th><th>Baterya</th></tr></thead>
+        <tbody>${data.map((r) => `
+          <tr class="${r.event === "login" ? "login" : r.event === "logout" ? "logout" : ""}">
+            <td>${escapeHtml(new Date(r.created_at).toLocaleString("fil-PH"))}</td>
+            <td>${escapeHtml(plainEvent(r.event))}</td>
+            <td>${escapeHtml(placeText(r))}</td>
+            <td>${escapeHtml(coordText(r))}</td>
+            <td>${escapeHtml(battText(r))}</td>
+          </tr>`).join("")}
+        </tbody>
+      </table>
+      </body></html>
+    `);
+    win.document.close();
+    win.focus();
+    win.print();
+  };
+}
+
+// ===== Admin: menu router (isa lang) =====
+document.querySelectorAll("#menu button[data-page]").forEach((btn) => {
+  btn.addEventListener("click", async () => {
+    document.querySelectorAll("#menu button").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+
+    const page = btn.dataset.page;
+    document.getElementById("pageTitle").textContent = page;
+    document.getElementById("panelTitle").textContent = page;
+
+    await showAdminPage(page);
+  });
 });
 
+// ===== Admin: delegated listener para sa mga button sa panel =====
+document.getElementById("panelContent").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-act]");
+  if (!btn || btn.disabled) return;
+
+  const act = btn.dataset.act;
+  const uid = btn.dataset.uid;
+  const name = btn.dataset.name;
+
+  if (act === "admin-chat") renderAdminChatPage(uid, name);
+  else if (act === "admin-history") renderUserHistory(uid, name);
+  else if (act === "admin-back") renderUserList(lastUserListMode || "users");
+  else if (act === "create-user") handleCreateUser(btn);
+  else if (act === "toggle-active") toggleUserActive(uid, btn.dataset.active !== "true");
+  else if (act === "live-chat") openLiveChat(uid);
+  else if (act === "nav-gmap") openGoogleMaps(parseFloat(btn.dataset.lat), parseFloat(btn.dataset.lng));
+  else if (act === "nav-waze") openWaze(parseFloat(btn.dataset.lat), parseFloat(btn.dataset.lng));
+});
+
+// ===== Admin: hamburger menu (mobile) =====
+const menuToggle = document.getElementById("menuToggle");
+const menuOverlay = document.getElementById("menuOverlay");
+const adminMenu = document.getElementById("menu");
+
+function openAdminMenu() {
+  adminMenu.classList.add("open");
+  menuOverlay.classList.add("show");
+}
+
+function closeAdminMenu() {
+  adminMenu.classList.remove("open");
+  menuOverlay.classList.remove("show");
+}
+
+if (menuToggle) {
+  menuToggle.addEventListener("click", () => {
+    adminMenu.classList.contains("open") ? closeAdminMenu() : openAdminMenu();
+  });
+}
+
+if (menuOverlay) menuOverlay.addEventListener("click", closeAdminMenu);
+
+document.querySelectorAll("#menu button").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    if (window.innerWidth <= 768) closeAdminMenu();
+  });
+});
+
+// ===== Startup: i-check ang session =====
 async function initializeApp() {
   if (checkingSession) return;
   checkingSession = true;
@@ -728,670 +1692,4 @@ async function initializeApp() {
   checkingSession = false;
 }
 
-// ===== Slide menu (drawer) =====
-const menuToggle = document.getElementById("menuToggle");
-const menuOverlay = document.getElementById("menuOverlay");
-const sideMenu = document.getElementById("menu");
-
-function openMenu() {
-  sideMenu.classList.add("open");
-  menuOverlay.classList.add("show");
-}
-
-function closeMenu() {
-  sideMenu.classList.remove("open");
-  menuOverlay.classList.remove("show");
-}
-
-menuToggle.addEventListener("click", openMenu);
-menuOverlay.addEventListener("click", closeMenu);
 initializeApp();
-
-async function fetchReverseGeocode(lat, lng) {
-  try {
-    const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}`);
-    const data = await res.json();
-    if (data && data.display_name) {
-      return data.display_name;
-    }
-    return "Maynila, Pilipinas";
-  } catch (e) {
-    return "Kasalukuyang Lokasyon (Pilipinas)";
-  }
-}
-
-// ===== Live GPS Map: popup =====
-function buildLivePopup(user, lat, lng) {
-  const wrap = document.createElement("div");
-  wrap.style.cssText = "font-family:Arial,sans-serif;font-size:13px;line-height:1.5;min-width:230px;";
-
-  const name = user.full_name || user.email || "User";
-  const place = user.location_name || "Hindi pa alam ang lugar";
-  const wazeUrl = `https://waze.com/ul?ll=${lat},${lng}&navigate=yes`;
-  const gmapsUrl = `https://www.google.com/maps/search/?api=1&query=${lat},${lng}`;
-  const hasPhone = !!user.phone;
-
-  const iconBtn =
-    "width:40px;height:40px;border-radius:50%;border:none;display:flex;align-items:center;" +
-    "justify-content:center;font-size:18px;text-decoration:none;cursor:pointer;" +
-    "box-shadow:0 1px 3px rgba(0,0,0,.3);padding:0;";
-
-  wrap.innerHTML = `
-    <strong style="font-size:14px;color:#1769aa;">${name}</strong><br>
-    📍 <b class="pp-place" style="font-size:14px;">${place}</b><br>
-    📊 <b>Status:</b> ${liveStatusBadge(user.is_online)}<br>
-    🔋 <b>Battery:</b> ${batteryLabel(user)}<br>
-    📞 <b>Phone:</b> ${user.phone || "Walang numero"}<br>
-
-    <div style="margin-top:10px;display:flex;justify-content:space-around;align-items:center;">
-      <a href="${wazeUrl}" target="_blank" title="Waze" style="${iconBtn}background:#33ccff;">🚗</a>
-      ${hasPhone
-        ? `<a href="tel:${user.phone}" title="Tawag" style="${iconBtn}background:#137333;">📞</a>`
-        : `<button type="button" title="Walang numero" disabled style="${iconBtn}background:#cbd5e1;cursor:not-allowed;">📞</button>`}
-      <a href="${gmapsUrl}" target="_blank" title="Google Maps" style="${iconBtn}background:#ea4335;">🗺️</a>
-      <button type="button" class="btn-chat" title="Chat" style="${iconBtn}background:#1769aa;color:#fff;">💬</button>
-    </div>
-  `;
-
-  wrap.querySelector(".btn-chat").addEventListener("click", () => openAdminChat(user));
-
-  return wrap;
-}
-
-// ===== Live GPS Map: markers =====
-function buildMarkerEl() {
-  const el = document.createElement("div");
-  el.style.cssText = "display:flex;flex-direction:column;align-items:center;cursor:pointer;";
-
-  el.innerHTML = `
-    <div class="lm-label" style="background:#fff;border:1px solid #cbd5e1;border-radius:6px;
-      padding:2px 6px;font:bold 11px Arial,sans-serif;color:#1e293b;white-space:nowrap;
-      box-shadow:0 1px 3px rgba(0,0,0,.25);margin-bottom:4px;"></div>
-    <div class="lm-pin" style="width:32px;height:32px;border-radius:50%;border:2px solid #fff;
-      box-shadow:0 1px 4px rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;
-      color:#fff;font:bold 15px Arial,sans-serif;"></div>
-  `;
-  return el;
-}
-
-function updateMarkerEl(el, user) {
-  const label = el.querySelector(".lm-label");
-  const pin = el.querySelector(".lm-pin");
-
-  const fullName = user.full_name || "User";
-  const initial = fullName.trim().charAt(0).toUpperCase();
-
-  label.textContent = fullName + " · " + shortPlace(user.location_name);
-  pin.textContent = initial;
-  pin.style.background = user.is_online ? "#137333" : "#94a3b8";
-}
-
-function renderLiveUser(user) {
-  const list = document.getElementById("liveUserList");
-  if (!list || !liveMap || user.role === "admin") return;
-
-  liveUserData[user.id] = user;
-
-  let li = list.querySelector(`li[data-user-id="${user.id}"]`);
-  if (!li) {
-    li = document.createElement("li");
-    li.dataset.userId = user.id;
-    list.appendChild(li);
-  }
-  const name = user.full_name || user.email || "User";
-  li.innerHTML = `<b>${name}</b> — Status: ${liveStatusBadge(user.is_online)} <span>🔋 ${batteryLabel(user)}</span> <span>📍 ${shortPlace(user.location_name)}</span>`;
-
-  const lat = parseFloat(user.latitude);
-  const lng = parseFloat(user.longitude);
-  if (isNaN(lat) || isNaN(lng) || lat === 0 || lng === 0) return;
-
-  const placeText = user.location_name || "Hindi pa alam ang lugar";
-  const existing = liveMarkers[user.id];
-
-  if (existing) {
-    existing.marker.setLngLat([lng, lat]);
-    updateMarkerEl(existing.marker.getElement(), user);
-
-    const popup = existing.marker.getPopup();
-    if (popup.isOpen()) {
-      const placeEl = popup.getElement()?.querySelector(".pp-place");
-      if (placeEl) placeEl.textContent = placeText;
-    }
-    return;
-  }
-
-  const el = buildMarkerEl();
-  updateMarkerEl(el, user);
-
-  const popup = new maplibregl.Popup({ offset: 25 }).setDOMContent(buildLivePopup(user, lat, lng));
-
-  popup.on("open", () => {
-    const u = liveUserData[user.id];
-    if (!u) return;
-    const uLat = parseFloat(u.latitude);
-    const uLng = parseFloat(u.longitude);
-    if (isNaN(uLat) || isNaN(uLng)) return;
-    popup.setDOMContent(buildLivePopup(u, uLat, uLng));
-  });
-
-  const marker = new maplibregl.Marker({ element: el, anchor: "bottom" })
-    .setLngLat([lng, lat])
-    .setPopup(popup)
-    .addTo(liveMap);
-
-  liveMarkers[user.id] = { marker };
-}
-
-function stopLivePoll() {
-  if (livePollTimer) {
-    clearInterval(livePollTimer);
-    livePollTimer = null;
-  }
-}
-
-async function refreshLiveUsers() {
-  if (!liveMap) {
-    stopLivePoll();
-    return;
-  }
-
-  const { data: users, error } = await db.from("profiles").select("*");
-  if (error || !users) return;
-
-  users.forEach(user => {
-    if (user.role === "admin") return;
-    renderLiveUser(user);
-  });
-}
-
-async function loadLiveMaplibre() {
-  const content = document.getElementById("panelContent");
-  content.innerHTML = `
-    <h3>Admin Live GPS Monitoring</h3>
-    <div style="display: flex; flex-direction: column; gap: 15px;">
-      <div id="mapContainer" style="width:100%; height:400px; border-radius:8px;"></div>
-      <div id="adminUserListContainer" style="background: #f8fafc; padding: 12px; border-radius: 8px; border: 1px solid #e2e8f0;">
-        <h4 style="margin-top: 0; font-size: 14px; color: #1e293b;">📋 Active Monitored Users</h4>
-        <div id="monitoredUsersList">Loading active users...</div>
-      </div>
-    </div>
-  `;
-
-  content.appendChild(buildAdminChatPanel());
-
-  liveMap = new maplibregl.Map({
-    container: "mapContainer",
-    style: "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
-    center: [120.9842, 14.5995],
-    zoom: 11
-  });
-  liveMap.addControl(new maplibregl.NavigationControl());
-  liveMarkers = {};
-  liveUserData = {};
-
-  const { data: users, error } = await db.from("profiles").select("*");
-
-  const listDiv = document.getElementById("monitoredUsersList");
-  if (!listDiv) return;
-
-  if (error) {
-    console.error("Supabase Error:", error);
-    listDiv.textContent = "Database Error: " + error.message;
-    return;
-  }
-
-  if (!users || users.length === 0) {
-    listDiv.textContent = "Wala pang rehistradong user sa database.";
-    return;
-  }
-
-  listDiv.innerHTML = "<ul id='liveUserList' style='margin: 0; padding-left: 18px; font-size: 13px; line-height: 1.6;'></ul>";
-
-  const bounds = new maplibregl.LngLatBounds();
-  let hasValidCoords = false;
-
-  users.forEach(user => {
-    if (user.role === "admin") return;
-    renderLiveUser(user);
-
-    const lat = parseFloat(user.latitude);
-    const lng = parseFloat(user.longitude);
-    if (!isNaN(lat) && !isNaN(lng) && lat !== 0 && lng !== 0) {
-      hasValidCoords = true;
-      bounds.extend([lng, lat]);
-    }
-  });
-
-  if (hasValidCoords) {
-    liveMap.fitBounds(bounds, { padding: 50, maxZoom: 15 });
-  }
-
-  stopLivePoll();
-  livePollTimer = setInterval(refreshLiveUsers, 10000);
-}
-
-// ===== Users / Accounts =====
-async function loadUsers() {
-  const content = document.getElementById("panelContent");
-  content.textContent = "Loading users...";
-
-  const { data, error } = await db
-    .from("profiles")
-    .select("id, full_name, email, role, location_sharing, is_online, created_at, battery_level, is_charging, phone")
-    .order("created_at", { ascending: false });
-
-  if (error) {
-    content.textContent = "Error loading users: " + error.message;
-    return;
-  }
-
-  if (!data || data.length === 0) {
-    content.textContent = "Wala pang registered users.";
-    return;
-  }
-
-  const table = document.createElement("table");
-  table.style.width = "100%";
-  table.style.borderCollapse = "collapse";
-
-  const header = document.createElement("tr");
-
-  ["Name", "Role", "Monitoring Status", "Battery", "Location Sharing", "Action"].forEach(label => {
-    const th = document.createElement("th");
-    th.textContent = label;
-    th.style.padding = "10px";
-    th.style.textAlign = "left";
-    th.style.borderBottom = "1px solid #ddd";
-    header.appendChild(th);
-  });
-
-  table.appendChild(header);
-
-  data.forEach(user => {
-    const row = document.createElement("tr");
-    row.dataset.userId = user.id;
-
-    const tdName = document.createElement("td");
-    tdName.textContent = user.full_name ?? "—";
-    tdName.style.padding = "10px";
-    tdName.style.borderBottom = "1px solid #eee";
-    row.appendChild(tdName);
-
-    const tdRole = document.createElement("td");
-    tdRole.textContent = user.role ?? "—";
-    tdRole.style.padding = "10px";
-    tdRole.style.borderBottom = "1px solid #eee";
-    row.appendChild(tdRole);
-
-    const tdStatus = document.createElement("td");
-    tdStatus.style.padding = "10px";
-    tdStatus.style.borderBottom = "1px solid #eee";
-    tdStatus.classList.add("status-cell");
-
-    const badge = document.createElement("span");
-    if (user.is_online) {
-      badge.className = "badge-online";
-      badge.textContent = "Online";
-    } else {
-      badge.className = "badge-offline";
-      badge.textContent = "Offline";
-    }
-    tdStatus.appendChild(badge);
-    row.appendChild(tdStatus);
-
-    const tdBattery = document.createElement("td");
-    tdBattery.style.padding = "10px";
-    tdBattery.style.borderBottom = "1px solid #eee";
-    tdBattery.classList.add("battery-cell");
-    tdBattery.textContent = batteryLabel(user);
-    row.appendChild(tdBattery);
-
-    const tdSharing = document.createElement("td");
-    tdSharing.textContent = user.location_sharing ? "Enabled" : "Disabled";
-    tdSharing.style.padding = "10px";
-    tdSharing.style.borderBottom = "1px solid #eee";
-    row.appendChild(tdSharing);
-
-    if (user.role === "user") {
-      const actionCell = document.createElement("td");
-      actionCell.style.padding = "10px";
-      actionCell.style.borderBottom = "1px solid #eee";
-
-      const btnContainer = document.createElement("div");
-      btnContainer.style.display = "flex";
-      btnContainer.style.flexWrap = "wrap";
-      btnContainer.style.gap = "6px";
-
-      const chatButton = document.createElement("button");
-      chatButton.textContent = "💬 Usapan";
-      chatButton.style.background = "#1769aa";
-      chatButton.style.color = "white";
-      chatButton.style.border = "none";
-      chatButton.style.padding = "6px 10px";
-      chatButton.style.borderRadius = "4px";
-
-      chatButton.addEventListener("click", () => openAdminChat(user));
-
-      const deactivateButton = document.createElement("button");
-      deactivateButton.textContent = "Deactivate";
-      deactivateButton.style.background = "#b42318";
-      deactivateButton.style.color = "white";
-      deactivateButton.style.border = "none";
-      deactivateButton.style.padding = "6px 10px";
-      deactivateButton.style.borderRadius = "4px";
-
-      deactivateButton.addEventListener("click", async () => {
-        if (!confirm("Sigurado ka bang ide-deactivate ang account na ito?")) return;
-
-        deactivateButton.disabled = true;
-        deactivateButton.textContent = "Processing...";
-
-        const { data: result, error } = await db.functions.invoke(
-          "admin-deactivate-user",
-          { body: { user_id: user.id } }
-        );
-
-        if (error || !result?.success) {
-          alert(result?.error || error?.message || "Deactivation failed.");
-          deactivateButton.disabled = false;
-          deactivateButton.textContent = "Deactivate";
-          return;
-        }
-
-        alert("User account deactivated.");
-        loadUsers();
-      });
-
-      const reactivateButton = document.createElement("button");
-      reactivateButton.textContent = "Reactivate";
-      reactivateButton.style.background = "#2b7a78";
-      reactivateButton.style.color = "white";
-      reactivateButton.style.border = "none";
-      reactivateButton.style.padding = "6px 10px";
-      reactivateButton.style.borderRadius = "4px";
-
-      reactivateButton.addEventListener("click", async () => {
-        if (!confirm("Sigurado ka bang i-reactivate ang account na ito?")) return;
-
-        reactivateButton.disabled = true;
-        reactivateButton.textContent = "Processing...";
-
-        const { data: result, error } = await db.functions.invoke(
-          "admin-reactivate-user",
-          { body: { user_id: user.id } }
-        );
-
-        if (error || !result?.success) {
-          alert(result?.error || error?.message || "Reactivation failed.");
-          reactivateButton.disabled = false;
-          reactivateButton.textContent = "Reactivate";
-          return;
-        }
-
-        alert("User account reactivated successfully.");
-        loadUsers();
-      });
-
-      btnContainer.appendChild(chatButton);
-      btnContainer.appendChild(deactivateButton);
-      btnContainer.appendChild(reactivateButton);
-      actionCell.appendChild(btnContainer);
-      row.appendChild(actionCell);
-    } else {
-      const actionCell = document.createElement("td");
-      actionCell.textContent = "—";
-      actionCell.style.padding = "10px";
-      actionCell.style.borderBottom = "1px solid #eee";
-      row.appendChild(actionCell);
-    }
-
-    table.appendChild(row);
-  });
-
-  const chatPanel = buildAdminChatPanel();
-  content.replaceChildren(table, chatPanel);
-  showCreateUserForm();
-}
-
-async function showCreateUserForm() {
-  const content = document.getElementById("panelContent");
-
-  const form = document.createElement("form");
-  form.style.marginBottom = "20px";
-
-  form.innerHTML = `
-    <h3>Create New User</h3>
-
-    <input id="newUserName" type="text" placeholder="Full Name" required
-      style="display:block;width:100%;padding:12px;margin:8px 0;">
-
-    <input id="newUserEmail" type="email" placeholder="Email Address" required
-      style="display:block;width:100%;padding:12px;margin:8px 0;">
-
-    <input id="newUserPassword" type="password" placeholder="Password (at least 8 characters)" minlength="8" required
-      style="display:block;width:100%;padding:12px;margin:8px 0;">
-
-      <input id="newUserPhone" type="tel" placeholder="Phone Number (hal: 09171234567)"
-    style="display:block;width:100%;padding:12px;margin:8px 0;">
-
-    <button type="submit" style="padding:12px 20px;">Create User</button>
-
-    <p id="createUserMessage"></p>
-  `;
-
-  form.addEventListener("submit", async (event) => {
-    event.preventDefault();
-
-    const message = document.getElementById("createUserMessage");
-    message.textContent = "Creating account...";
-
-    const fullName = document.getElementById("newUserName").value.trim();
-    const email = document.getElementById("newUserEmail").value.trim();
-    const password = document.getElementById("newUserPassword").value;
-
-const phone = document.getElementById("newUserPhone").value.trim();
-
-const { data, error } = await db.functions.invoke("admin-create-user", {
-  body: { full_name: fullName, email: email, password: password, phone: phone }
-});
-
-    
-    
-
-    if (error) {
-      message.textContent = "Error: " + error.message;
-      return;
-    }
-
-    if (!data || !data.success) {
-      message.textContent = data?.error || "Account creation failed.";
-      return;
-    }
-
-    message.textContent = "User account created successfully!";
-    form.reset();
-  });
-
-  content.prepend(form);
-}
-
-// ===== Geofence =====
-async function loadGeofencePanel() {
-  if (geoMap) {
-    geoMap.remove();
-    geoMap = null;
-    geoMarker = null;
-  }
-
-  const content = document.getElementById("panelContent");
-  content.innerHTML = `
-    <h3>Pamamahala ng Geofence Zone</h3>
-    <p style="color:#64748b; font-size:13px;">I-click ang mapa sa ibaba para piliin ang lokasyon ng geofence zone, o i-type ang detalye.</p>
-
-    <div class="geofence-form">
-      <input id="geoName" type="text" placeholder="Pangalan ng Zone (Hal: Main Office / Terminal)" />
-
-      <div style="display: flex; gap: 10px;">
-        <input id="geoLat" type="number" step="any" placeholder="Latitude" style="flex:1;" />
-        <input id="geoLng" type="number" step="any" placeholder="Longitude" style="flex:1;" />
-      </div>
-
-      <input id="geoRadius" type="number" placeholder="Radius sa Metro (Hal: 500)" value="500" />
-
-      <p style="font-size:12px; font-weight:bold; margin:10px 0 5px 0; color:#173c60;">🗺️ Pindutin sa mapa para sa lokasyon:</p>
-      <div id="geoPickerMap" style="width:100%; height:250px; border-radius:8px; border:1px solid #ccd5df; margin-bottom:10px;"></div>
-
-      <button class="primary" id="saveGeofenceBtn" style="padding:10px;">I-save ang Geofence</button>
-      <p id="geoMessage" style="font-size:13px; margin-top:10px; color:#1769aa;"></p>
-    </div>
-
-    <div id="geofenceList"></div>
-  `;
-
-  initGeoPickerMap();
-  fetchGeofences();
-
-  document.getElementById("saveGeofenceBtn").addEventListener("click", async () => {
-    const name = document.getElementById("geoName").value.trim();
-    const latitude = parseFloat(document.getElementById("geoLat").value);
-    const longitude = parseFloat(document.getElementById("geoLng").value);
-    const radius = parseFloat(document.getElementById("geoRadius").value);
-    const msg = document.getElementById("geoMessage");
-
-    if (!name || isNaN(latitude) || isNaN(longitude) || isNaN(radius)) {
-      msg.style.color = "#b42318";
-      msg.textContent = "Mangyaring punan nang tama ang lahat o i-click ang mapa.";
-      return;
-    }
-
-    msg.style.color = "#1769aa";
-    msg.textContent = "Sine-save ang geofence...";
-
-    const { error } = await db.from("geofences").insert([{ name, latitude, longitude, radius }]);
-
-    if (error) {
-      msg.style.color = "#b42318";
-      msg.textContent = "Error: " + error.message;
-      return;
-    }
-
-    msg.style.color = "#137333";
-    msg.textContent = "Matagumpay na na-save ang Geofence zone!";
-    document.getElementById("geoName").value = "";
-    document.getElementById("geoLat").value = "";
-    document.getElementById("geoLng").value = "";
-    document.getElementById("geoRadius").value = "500";
-
-    fetchGeofences();
-  });
-}
-
-let geoMap = null;
-let geoMarker = null;
-
-function initGeoPickerMap() {
-  if (geoMap) return;
-
-  geoMap = new maplibregl.Map({
-    container: "geoPickerMap",
-    style: "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
-    center: [120.9842, 14.5995],
-    zoom: 12
-  });
-
-  geoMap.addControl(new maplibregl.NavigationControl());
-
-  geoMap.on("load", () => {
-    geoMap.addSource("geofence-radius", {
-      type: "geojson",
-      data: { type: "FeatureCollection", features: [] }
-    });
-
-    geoMap.addLayer({
-      id: "geofence-circle-fill",
-      type: "fill",
-      source: "geofence-radius",
-      paint: { "fill-color": "#1769aa", "fill-opacity": 0.25 }
-    });
-
-    geoMap.addLayer({
-      id: "geofence-circle-border",
-      type: "line",
-      source: "geofence-radius",
-      paint: { "line-color": "#1769aa", "line-width": 2 }
-    });
-  });
-
-  geoMap.on("click", (e) => {
-    const lng = e.lngLat.lng;
-    const lat = e.lngLat.lat;
-
-    document.getElementById("geoLat").value = lat.toFixed(6);
-    document.getElementById("geoLng").value = lng.toFixed(6);
-
-    if (!geoMarker) {
-      geoMarker = new maplibregl.Marker({ color: "#b42318" })
-        .setLngLat([lng, lat])
-        .addTo(geoMap);
-    } else {
-      geoMarker.setLngLat([lng, lat]);
-    }
-
-    updateGeoCirclePreview(lng, lat);
-  });
-}
-
-function updateGeoCirclePreview(lng, lat) {
-  if (!geoMap || !geoMap.getSource("geofence-radius")) return;
-
-  const radiusInMeters = parseFloat(document.getElementById("geoRadius").value) || 500;
-  const points = 64;
-  const coords = [];
-  const km = radiusInMeters / 1000;
-
-  for (let i = 0; i < points; i++) {
-    const angle = (i * 360) / points;
-    const dx = km * Math.cos((angle * Math.PI) / 180);
-    const dy = km * Math.sin((angle * Math.PI) / 180);
-
-    const latDelta = dy / 110.574;
-    const lngDelta = dx / (111.320 * Math.cos((lat * Math.PI) / 180));
-
-    coords.push([lng + lngDelta, lat + latDelta]);
-  }
-  coords.push(coords[0]);
-
-  geoMap.getSource("geofence-radius").setData({
-    type: "Feature",
-    geometry: { type: "Polygon", coordinates: [coords] }
-  });
-}
-
-async function fetchGeofences() {
-  const listContainer = document.getElementById("geofenceList");
-  if (!listContainer) return;
-
-  const { data, error } = await db.from("geofences").select("*").order("created_at", { ascending: false });
-
-  if (error || !data || data.length === 0) {
-    listContainer.innerHTML = "<p style='font-size:13px; color:#64748b;'>Wala pang nakitang geofence zone.</p>";
-    return;
-  }
-
-  let html = `<h4>Mga Naka-set na Geofence Zones:</h4><ul style="padding-left: 20px; font-size: 14px; line-height: 1.6;">`;
-
-  for (const zone of data) {
-    const placeName = await fetchReverseGeocode(zone.latitude, zone.longitude);
-
-    html += `
-      <li style="margin-bottom: 8px;">
-        <b>${zone.name}</b><br>
-        <span style="color:#64748b; font-size:13px;">📍 ${placeName}</span><br>
-        <span style="font-size:12px; color:#1769aa;">(Radius: ${zone.radius}m)</span>
-      </li>
-    `;
-  }
-
-  html += `</ul>`;
-  listContainer.innerHTML = html;
-}
