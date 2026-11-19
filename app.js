@@ -56,6 +56,7 @@ function showLogin(message = "") {
   liveMap = null;
   stopAdminRealtime();
   stopOwnProfileWatch();
+  stopAdminGps();
 
   if (watchPositionId !== null) {
     navigator.geolocation.clearWatch(watchPositionId);
@@ -101,6 +102,7 @@ function showAdminDashboard(profile) {
     "Welcome, " + profile.full_name + " (Admin)";
 
   startAdminRealtime();
+  startAdminGps();
   showAdminPage("Dashboard");
 }
 
@@ -1022,7 +1024,119 @@ async function fetchReverseGeocode(lat, lng) {
   }
 }
 
+// ===== Admin: GPS ng admin (para sa ruta) =====
+let adminGpsWatchId = null;
+
+function startAdminGps() {
+  stopAdminGps();
+  if (!("geolocation" in navigator)) return;
+
+  adminGpsWatchId = navigator.geolocation.watchPosition(
+    (position) => {
+      lastGeoLat = position.coords.latitude;
+      lastGeoLng = position.coords.longitude;
+    },
+    (error) => {
+      console.warn("Admin GPS error:", error.message);
+    },
+    { enableHighAccuracy: true }
+  );
+}
+
+function stopAdminGps() {
+  if (adminGpsWatchId !== null) {
+    navigator.geolocation.clearWatch(adminGpsWatchId);
+    adminGpsWatchId = null;
+  }
+}
+
+// ===== Admin: ruta sa mapa =====
+let adminRouteSrc = "admin-route-src";
+let adminRouteLayer = "admin-route-line";
+let adminRouteMarker = null;
+
+function clearAdminRoute() {
+  if (!liveMap) return;
+  if (liveMap.getLayer(adminRouteLayer)) liveMap.removeLayer(adminRouteLayer);
+  if (liveMap.getSource(adminRouteSrc)) liveMap.removeSource(adminRouteSrc);
+  if (adminRouteMarker) {
+    adminRouteMarker.remove();
+    adminRouteMarker = null;
+  }
+  const btn = document.getElementById("adminClearRouteBtn");
+  if (btn) btn.remove();
+}
+
+function ensureAdminClearRouteButton() {
+  if (document.getElementById("adminClearRouteBtn")) return;
+  const container = document.getElementById("liveMapContainer");
+  if (!container) return;
+
+  const btn = document.createElement("button");
+  btn.id = "adminClearRouteBtn";
+  btn.type = "button";
+  btn.textContent = "✕ Alisin ruta";
+  btn.style.cssText =
+    "margin-top:8px;margin-right:6px;padding:6px 10px;background:#64748b;color:#fff;" +
+    "border:none;border-radius:6px;font-size:13px;";
+  btn.onclick = clearAdminRoute;
+  container.insertAdjacentElement("afterend", btn);
+}
+
+async function showAdminRouteOnMap(toLat, toLng, name) {
+  if (!liveMap) return alert("Hindi pa handa ang mapa. Buksan muna ang Live GPS Map.");
+  if (isNaN(toLat) || isNaN(toLng)) return alert("Walang lokasyon ang user na ito.");
+
+  // Ruta mula sa admin papunta sa user: gamitin ang lokasyon ng admin kung meron
+  const me = getMyLngLat();
+  if (!me) return alert("Hindi pa alam ang lokasyon mo. Hintayin ang GPS sa user page o buksan ang admin GPS.");
+
+  let coords = [[me.lng, me.lat], [toLng, toLat]];
+  try {
+    const url = `https://router.project-osrm.org/route/v1/driving/${me.lng},${me.lat};${toLng},${toLat}?overview=full&geometries=geojson`;
+    const res = await fetch(url);
+    const json = await res.json();
+    if (json.code === "Ok" && json.routes && json.routes[0]) {
+      coords = json.routes[0].geometry.coordinates;
+    }
+  } catch (e) {
+    console.warn("Hindi ma-reach ang routing service, straight line ang gagamitin.", e);
+  }
+
+  if (!liveMap.isStyleLoaded()) {
+    await new Promise((resolve) => liveMap.once("load", resolve));
+  }
+
+  const geojson = { type: "Feature", geometry: { type: "LineString", coordinates: coords } };
+
+  if (liveMap.getSource(adminRouteSrc)) {
+    liveMap.getSource(adminRouteSrc).setData(geojson);
+  } else {
+    liveMap.addSource(adminRouteSrc, { type: "geojson", data: geojson });
+    liveMap.addLayer({
+      id: adminRouteLayer,
+      type: "line",
+      source: adminRouteSrc,
+      layout: { "line-join": "round", "line-cap": "round" },
+      paint: { "line-color": "#1769aa", "line-width": 5, "line-opacity": 0.85 }
+    });
+  }
+
+  if (adminRouteMarker) adminRouteMarker.remove();
+  adminRouteMarker = new maplibregl.Marker({ color: "#dc2626" })
+    .setLngLat([toLng, toLat])
+    .setPopup(new maplibregl.Popup({ offset: 16 }).setText("Patutungo: " + name))
+    .addTo(liveMap);
+
+  const bounds = new maplibregl.LngLatBounds();
+  coords.forEach((c) => bounds.extend(c));
+  liveMap.fitBounds(bounds, { padding: 60, maxZoom: 16 });
+
+  ensureAdminClearRouteButton();
+}
+
 // ===== Admin: Live GPS Map =====
+
 function initLiveMap() {
   if (liveMap || typeof maplibregl === "undefined") return;
 
@@ -1087,6 +1201,7 @@ function buildLiveAdminPopup(uid) {
       <button type="button" class="lp-chat" style="${btnBase}background:#1769aa;">💬 Chat</button>
       <button type="button" class="lp-gmap" style="${btnBase}background:#4285f4;">Google Maps</button>
       <button type="button" class="lp-waze" style="${btnBase}background:#33ccff;color:#0b1f2a;">Waze</button>
+      <button type="button" class="lp-route" style="${btnBase}background:#0f766e;">🧭 Ruta</button>
     </div>
   `;
 
@@ -1098,6 +1213,10 @@ function buildLiveAdminPopup(uid) {
   wrap.querySelector(".lp-waze").onclick = () => {
     const u = liveUserData[uid];
     if (u && u.latitude != null) openWaze(u.latitude, u.longitude);
+  };
+  wrap.querySelector(".lp-route").onclick = () => {
+    const u = liveUserData[uid];
+    if (u && u.latitude != null) showAdminRouteOnMap(u.latitude, u.longitude, u.full_name || "User");
   };
 
   return wrap;
@@ -1170,6 +1289,7 @@ function renderAdminLiveList(rows) {
           <button type="button" data-act="live-chat" data-uid="${escapeHtml(p.id)}" style="${btn}background:#1769aa;">💬 Chat</button>
           <button type="button" data-act="nav-gmap" data-lat="${lat}" data-lng="${lng}" ${disabled} style="${btn}background:#4285f4;">Google Maps</button>
           <button type="button" data-act="nav-waze" data-lat="${lat}" data-lng="${lng}" ${disabled} style="${btn}background:#33ccff;color:#0b1f2a;">Waze</button>
+          <button type="button" data-act="nav-route" data-lat="${lat}" data-lng="${lng}" data-name="${name}" ${disabled} style="${btn}background:#0f766e;">🧭 Ruta</button>
         </td>
       </tr>`;
   }).join("");
@@ -1393,7 +1513,7 @@ async function renderUserList(mode) {
 
   const { data, error } = await db
     .from("profiles")
-    .select("id, full_name, phone, role, is_active, is_online, last_seen, battery_level, is_charging, location_name")
+    .select("id, full_name, phone, role, is_active, is_online, last_seen, battery_level, is_charging, location_name, latitude, longitude")
     .neq("role", "admin")
     .order("full_name", { ascending: true });
 
@@ -1426,6 +1546,9 @@ async function renderUserList(mode) {
       actions += active
         ? `<button type="button" data-act="toggle-active" data-uid="${uid}" data-active="true" style="${btn}background:#b42318;">⏸ Deactivate</button>`
         : `<button type="button" data-act="toggle-active" data-uid="${uid}" data-active="false" style="${btn}background:#137333;">▶ Activate</button>`;
+    }
+    if (p.latitude != null && p.longitude != null) {
+      actions += `<button type="button" data-act="nav-route" data-lat="${p.latitude}" data-lng="${p.longitude}" data-name="${name}" style="${btn}background:#0f766e;">🧭 Ruta</button>`;
     }
 
     return `
@@ -1644,6 +1767,7 @@ document.getElementById("panelContent").addEventListener("click", (e) => {
   else if (act === "live-chat") openLiveChat(uid);
   else if (act === "nav-gmap") openGoogleMaps(parseFloat(btn.dataset.lat), parseFloat(btn.dataset.lng));
   else if (act === "nav-waze") openWaze(parseFloat(btn.dataset.lat), parseFloat(btn.dataset.lng));
+  else if (act === "nav-route") showAdminRouteOnMap(parseFloat(btn.dataset.lat), parseFloat(btn.dataset.lng), btn.dataset.name || "User");
 });
 
 // ===== Admin: hamburger menu (mobile) =====
