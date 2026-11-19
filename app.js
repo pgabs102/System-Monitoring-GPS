@@ -289,6 +289,25 @@ function initUserMap() {
 
   userMap.addControl(new maplibregl.NavigationControl());
   addRecenterButton();
+  addUserPlaceToggle();
+}
+
+function addUserPlaceToggle() {
+  const container = document.getElementById("userMapContainer");
+  if (!container || document.getElementById("userPlaceToggleBtn")) return;
+
+  const btn = document.createElement("button");
+  btn.id = "userPlaceToggleBtn";
+  btn.type = "button";
+  btn.textContent = showPlaceLabels ? "🏷️ Lugar: ON" : "🏷️ Lugar: OFF";
+  btn.style.cssText =
+    "margin-top:8px;margin-left:6px;padding:6px 10px;background:#1769aa;color:#fff;" +
+    "border:none;border-radius:6px;font-size:13px;";
+  btn.onclick = () => {
+    togglePlaceLabels();
+    btn.textContent = showPlaceLabels ? "🏷️ Lugar: ON" : "🏷️ Lugar: OFF";
+  };
+  container.insertAdjacentElement("afterend", btn);
 }
 
 // ===== Chat =====
@@ -590,7 +609,7 @@ function startUserTracking(userId) {
 
       const moved =
         lastGeoLat === null ||
-        distanceMeters(lastGeoLat, lastGeoLng, lat, lng) > 30;
+        distanceMeters(lastGeoLat, lastGeoLng, lat, lng) > 50;
 
       if (moved) {
         lastGeoLat = lat;
@@ -629,12 +648,17 @@ function startUserTracking(userId) {
           mapCenteredOnce = true;
         }
         if (!userMarker) {
-          userMarker = new maplibregl.Marker({ color: "#1769aa" })
+          const selfEl = document.createElement("div");
+          selfEl.style.cssText = "width:18px;height:18px;border-radius:50%;background:#1769aa;border:3px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.35);position:relative;";
+          selfEl.innerHTML = '<span class="place-label"></span>';
+          userMarker = new maplibregl.Marker({ element: selfEl })
             .setLngLat([lng, lat])
             .addTo(userMap);
         } else {
           userMarker.setLngLat([lng, lat]);
         }
+        const selfLabel = userMarker.getElement().querySelector(".place-label");
+        if (selfLabel) selfLabel.textContent = shortPlace(lastPlaceName);
       }
     },
     (error) => {
@@ -839,11 +863,21 @@ function renderOtherUserMarkers(rows) {
       el.textContent = (Array.from((p.full_name || "U").trim())[0] || "U").toUpperCase();
       el.title = p.full_name || "User";
       existing.getPopup().setText(label);
+      let lbl = el.querySelector(".place-label");
+      if (!lbl) {
+        lbl = document.createElement("span");
+        lbl.className = "place-label";
+        el.appendChild(lbl);
+      }
+      lbl.textContent = shortPlace(p.location_name);
     } else {
+      const el = makeInitialMarkerEl(p.full_name, online);
+      const lbl = document.createElement("span");
+      lbl.className = "place-label";
+      lbl.textContent = shortPlace(p.location_name);
+      el.appendChild(lbl);
       const popup = new maplibregl.Popup({ offset: 16 }).setText(label);
-      otherUserMarkers[p.id] = new maplibregl.Marker({
-        element: makeInitialMarkerEl(p.full_name, online)
-      })
+      otherUserMarkers[p.id] = new maplibregl.Marker({ element: el })
         .setLngLat(lngLat)
         .setPopup(popup)
         .addTo(userMap);
@@ -1013,11 +1047,13 @@ function stopLivePoll() {
 async function fetchReverseGeocode(lat, lng) {
   try {
     const res = await fetch(
-      `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}`,
+      `https://nominatim.openstreetmap.org/reverse?format=json&zoom=18&lat=${lat}&lon=${lng}`,
       { headers: { "Accept-Language": "fil,en" } }
     );
     const data = await res.json();
-    return data.display_name || null;
+    if (!data.display_name) return null;
+    const short = data.display_name.split(",").slice(0, 2).join(",").trim();
+    return data.name ? data.name + ", " + short : data.display_name;
   } catch (e) {
     console.error("Reverse geocode error:", e);
     return null;
@@ -1135,6 +1171,28 @@ async function showAdminRouteOnMap(toLat, toLng, name) {
   ensureAdminClearRouteButton();
 }
 
+// ===== Toggle ng pangalan ng lugar sa mapa =====
+let showPlaceLabels = true;
+
+const placeLabelStyle = document.createElement("style");
+placeLabelStyle.textContent = `
+  .place-label {
+    position: absolute; left: 32px; top: 2px; white-space: nowrap;
+    background: #fff; color: #1e293b; font: 600 11px Arial, sans-serif;
+    padding: 2px 6px; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,.3);
+    pointer-events: none;
+  }
+  .hide-place-labels .place-label { display: none; }
+`;
+document.head.appendChild(placeLabelStyle);
+
+function togglePlaceLabels() {
+  showPlaceLabels = !showPlaceLabels;
+  document.body.classList.toggle("hide-place-labels", !showPlaceLabels);
+  const btn = document.getElementById("togglePlaceBtn");
+  if (btn) btn.textContent = showPlaceLabels ? "🏷️ Lugar: ON" : "🏷️ Lugar: OFF";
+}
+
 // ===== Admin: Live GPS Map =====
 
 function initLiveMap() {
@@ -1152,10 +1210,13 @@ function initLiveMap() {
 
 function renderLiveMapPage() {
   setAdminContent(`
+    <button type="button" id="togglePlaceBtn" style="margin-bottom:8px;padding:6px 10px;border:none;border-radius:6px;background:#1769aa;color:#fff;font-size:13px;">${showPlaceLabels ? "🏷️ Lugar: ON" : "🏷️ Lugar: OFF"}</button>
     <div id="liveMapContainer" style="height:450px;border-radius:8px;"></div>
     <div id="adminLiveList" style="margin-top:12px;"></div>
     <div id="liveChatPanel" style="margin-top:12px;"></div>
   `);
+  document.getElementById("togglePlaceBtn").addEventListener("click", togglePlaceLabels);
+  document.body.classList.toggle("hide-place-labels", !showPlaceLabels);
   initLiveMap();
   loadLiveUsers();
   livePollTimer = setInterval(loadLiveUsers, 30000);
@@ -1247,6 +1308,14 @@ function renderLiveUser(row) {
   el.style.background = online ? "#137333" : "#94a3b8";
   el.textContent = (Array.from(name.trim())[0] || "U").toUpperCase();
   el.title = name;
+
+  let label = el.querySelector(".place-label");
+  if (!label) {
+    label = document.createElement("span");
+    label.className = "place-label";
+    el.appendChild(label);
+  }
+  label.textContent = shortPlace(row.location_name);
 
   content.querySelector(".lp-name").textContent = name;
   content.querySelector(".lp-status").innerHTML = online
